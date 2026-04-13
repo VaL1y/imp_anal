@@ -1,196 +1,136 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
 import numpy as np
 
 
-class PeriodAnalyzer:
-    def __init__(
-        self,
-        method: str = "autocorr",
-        tolerant: bool = False,
-        tolerance: float = 0.15,
-        online_buffer_size: int = 8192,
-        min_samples_to_analyze: int = 512,
-        min_period_ratio: float = 0.08,
-        debug: bool = False,
-    ):
-        self.method = method
-        self.tolerant = tolerant
-        self.tolerance = tolerance
-        self.online_buffer_size = online_buffer_size
-        self.min_samples_to_analyze = min_samples_to_analyze
-        self.min_period_ratio = min_period_ratio
-        self.debug = debug
-
-        self.buffer = []
-
-        self.detected_period = None
-        self.period_history = []
-
-        self.last_signal = None
-        self.last_scores = None
-        self.last_autocorr = None
-        self.last_fft_magnitude = None
-        self.last_method_used = None
-
-    @staticmethod
-    def _autocorrelation(signal: np.ndarray) -> np.ndarray:
-        corr = np.correlate(signal, signal, mode="full")
-        return corr[len(corr) // 2:]
-
-    @staticmethod
-    def _find_peaks_simple(x: np.ndarray) -> np.ndarray:
-        if len(x) < 3:
-            return np.array([], dtype=int)
-
-        peaks = []
-        for i in range(1, len(x) - 1):
-            if x[i] > x[i - 1] and x[i] >= x[i + 1]:
-                peaks.append(i)
-        return np.array(peaks, dtype=int)
-
-    @staticmethod
-    def _moving_average(x: np.ndarray, window: int) -> np.ndarray:
-        if window <= 1:
-            return x.copy()
-
-        kernel = np.ones(window, dtype=float) / window
-        return np.convolve(x, kernel, mode="same")
-
-    def _score_peak(self, values: np.ndarray, idx: int) -> float:
-        if not self.tolerant:
-            return float(values[idx])
-
-        radius = max(1, int(round(self.tolerance * 10)))
-        left = max(0, idx - radius)
-        right = min(len(values), idx + radius + 1)
-        return float(np.mean(values[left:right]))
-
-    def _select_candidate_peaks(self, corr: np.ndarray, signal_length: int) -> np.ndarray:
-        """
-        Отсекаем слишком малые лаги, чтобы не ловить расстояние
-        между импульсами внутри пачки.
-        """
-        peaks = self._find_peaks_simple(corr)
-        if len(peaks) == 0:
-            return peaks
-
-        min_period = max(2, int(signal_length * self.min_period_ratio))
-        peaks = peaks[peaks >= min_period]
-
-        return peaks
+@dataclass(slots=True)
+class PeriodSearchResult:
+    estimated_period: int
+    score_curve: np.ndarray
+    lag_values: np.ndarray
+    best_score: float
+    second_best_score: float
+    confidence_ratio: float
+    normalized_peak: float
+    is_plausible: bool
 
 
-    def _detect_period_autocorr(self, signal: np.ndarray) -> int | None:
-        corr = self._autocorrelation(signal).astype(float)
+@dataclass(slots=True)
+class PeriodSearchConfig:
+    min_period: int
+    max_period: int
+    top_exclusion_radius: int = 5
+    min_confidence_ratio: float = 1.08
+    min_normalized_peak: float = 0.10
 
-        if len(corr) < 3:
-            self.last_autocorr = corr
-            self.last_scores = corr
-            return None
 
-        corr[0] = 0.0
+def _normalize_signal(signal: np.ndarray) -> np.ndarray:
+    """Убирает среднее и нормирует по энергии."""
+    centered = signal - np.mean(signal)
+    energy = np.linalg.norm(centered)
+    if energy == 0:
+        return centered
+    return centered / energy
 
-        processed_corr = corr.copy()
-        if self.tolerant:
-            processed_corr = self._moving_average(processed_corr, window=5)
 
-        peaks = self._select_candidate_peaks(processed_corr, len(signal))
-        if len(peaks) == 0:
-            self.last_autocorr = corr
-            self.last_scores = processed_corr
-            return None
+def shift_sum_score(signal: np.ndarray, lag: int) -> float:
+    """Скалярная мера похожести сигнала и его копии со сдвигом.
 
-        scored_peaks = [(peak, self._score_peak(processed_corr, peak)) for peak in peaks]
-        scored_peaks.sort(key=lambda item: item[1], reverse=True)
+    По сути это нормированное суммирование произведений со сдвигом.
+    """
+    if lag <= 0 or lag >= len(signal):
+        return float("-inf")
 
-        detected = int(scored_peaks[0][0])
+    left = signal[:-lag]
+    right = signal[lag:]
+    return float(np.sum(left * right))
 
-        self.last_autocorr = corr
-        self.last_scores = processed_corr
 
-        if self.debug:
-            top = scored_peaks[:10]
-            print("[AUTOCORR] top peaks:", [(int(p), round(float(s), 2)) for p, s in top])
+def search_period_by_shift_sum(
+    raw_signal: np.ndarray,
+    config: PeriodSearchConfig,
+) -> PeriodSearchResult:
+    """Ищет период по максимуму функции суммирования со сдвигом."""
+    signal = _normalize_signal(raw_signal)
 
-        return detected
+    lag_values = np.arange(config.min_period, config.max_period + 1)
+    score_curve = np.array([shift_sum_score(signal, lag) for lag in lag_values], dtype=float)
 
-    # def _detect_period_fft(self, signal: np.ndarray) -> int | None:
-    #     n = len(signal)
-    #     if n < 2:
-    #         return None
-    #
-    #     spectrum = np.fft.rfft(signal)
-    #     magnitude = np.abs(spectrum)
-    #     magnitude[0] = 0.0
-    #
-    #     self.last_fft_magnitude = magnitude
-    #     self.last_scores = magnitude
-    #
-    #     # пропускаем слишком высокие частоты, которые соответствуют слишком маленьким периодам
-    #     max_bin_to_ignore = max(1, int(len(magnitude) * 0.05))
-    #     magnitude_search = magnitude.copy()
-    #     magnitude_search[max_bin_to_ignore:] = magnitude[max_bin_to_ignore:]
-    #
-    #     peak_bin = np.argmax(magnitude_search[1:]) + 1
-    #     if peak_bin <= 0:
-    #         return None
-    #
-    #     period = int(round(n / peak_bin))
-    #
-    #     if self.debug:
-    #         print(f"[FFT] peak_bin={peak_bin}, estimated_period={period}")
-    #
-    #     return period
+    best_idx = int(np.argmax(score_curve))
+    estimated_period = int(lag_values[best_idx])
+    best_score = float(score_curve[best_idx])
 
-    def _run_detection(self, signal: np.ndarray) -> int | None:
-        self.last_signal = np.asarray(signal, dtype=float)
-        self.last_method_used = self.method
+    # Ищем второй максимум вне небольшой окрестности главного пика.
+    mask = np.ones_like(score_curve, dtype=bool)
+    left = max(0, best_idx - config.top_exclusion_radius)
+    right = min(len(score_curve), best_idx + config.top_exclusion_radius + 1)
+    mask[left:right] = False
 
-        if self.method == "autocorr":
-            return self._detect_period_autocorr(self.last_signal)
+    if np.any(mask):
+        second_best_score = float(np.max(score_curve[mask]))
+    else:
+        second_best_score = float("-inf")
 
-        # if self.method == "fft":
-        #     return self._detect_period_fft(self.last_signal)
+    if np.isfinite(second_best_score) and second_best_score != 0:
+        confidence_ratio = best_score / second_best_score
+    else:
+        confidence_ratio = float("inf")
 
-        raise ValueError(f"Unsupported method: {self.method}")
+    score_mean = float(np.mean(score_curve))
+    score_std = float(np.std(score_curve))
+    normalized_peak = 0.0 if score_std == 0 else (best_score - score_mean) / score_std
 
-    def analyze_offline(self, signal: np.ndarray) -> int | None:
-        self.detected_period = self._run_detection(np.asarray(signal, dtype=float))
-        return self.detected_period
+    is_plausible = (
+        confidence_ratio >= config.min_confidence_ratio
+        and normalized_peak >= config.min_normalized_peak
+    )
 
-    def update_online(self, samples) -> int | None:
-        """
-        Можно подавать:
-        - один sample
-        - список
-        - numpy array (батч)
-        """
-        if np.isscalar(samples):
-            samples = [samples]
+    return PeriodSearchResult(
+        estimated_period=estimated_period,
+        score_curve=score_curve,
+        lag_values=lag_values,
+        best_score=best_score,
+        second_best_score=second_best_score,
+        confidence_ratio=confidence_ratio,
+        normalized_peak=normalized_peak,
+        is_plausible=is_plausible,
+    )
 
-        for sample in samples:
-            self.buffer.append(float(sample))
+def validate_period(raw_signal: np.ndarray, estimated_period: int) -> dict[str, float | bool]:
+    """Набор простых проверок, что найденный период действительно разумный."""
+    if estimated_period <= 0 or estimated_period >= len(raw_signal):
+        return {
+            "is_valid": False,
+            "repeat_consistency": 0.0,
+            "energy_ratio": 0.0,
+        }
 
-        if len(self.buffer) > self.online_buffer_size:
-            overflow = len(self.buffer) - self.online_buffer_size
-            self.buffer = self.buffer[overflow:]
+    signal = raw_signal - np.mean(raw_signal)
+    first = signal[:-estimated_period]
+    second = signal[estimated_period:]
 
-        if len(self.buffer) < self.min_samples_to_analyze:
-            self.period_history.append(None)
-            return None
+    denom = np.linalg.norm(first) * np.linalg.norm(second)
+    repeat_consistency = 0.0 if denom == 0 else float(np.dot(first, second) / denom)
 
-        signal = np.array(self.buffer, dtype=float)
-        detected = self._run_detection(signal)
+    folded = signal[: len(signal) // estimated_period * estimated_period]
+    if len(folded) == 0:
+        return {
+            "is_valid": False,
+            "repeat_consistency": repeat_consistency,
+            "energy_ratio": 0.0,
+        }
 
-        self.detected_period = detected
-        self.period_history.append(detected)
-        return detected
+    matrix = folded.reshape(-1, estimated_period)
+    mean_template = np.mean(matrix, axis=0)
+    template_energy = float(np.linalg.norm(mean_template))
+    full_energy = float(np.linalg.norm(signal) / max(1, matrix.shape[0]))
+    energy_ratio = 0.0 if full_energy == 0 else template_energy / full_energy
 
-    def reset_online(self):
-        self.buffer = []
-        self.detected_period = None
-        self.period_history = []
-        self.last_signal = None
-        self.last_scores = None
-        self.last_autocorr = None
-        self.last_fft_magnitude = None
-        self.last_method_used = None
+    is_valid = repeat_consistency > 0.7 and energy_ratio > 0.5
+    return {
+        "is_valid": is_valid,
+        "repeat_consistency": repeat_consistency,
+        "energy_ratio": energy_ratio,
+    }
