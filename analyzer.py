@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Sequence
 
+import matplotlib.pyplot as plt
 import numpy as np
+
+from generator import rasterize_impulse_times
 
 
 @dataclass(slots=True)
@@ -24,6 +28,14 @@ class PeriodSearchConfig:
     top_exclusion_radius: int = 5
     min_confidence_ratio: float = 1.08
     min_normalized_peak: float = 0.10
+
+
+@dataclass(slots=True)
+class StrobeWindow:
+    """Представление временного окна — «стробы» — вокруг отдельного импульса."""
+
+    start_ms: float
+    end_ms: float
 
 
 def _normalize_signal(signal: np.ndarray) -> np.ndarray:
@@ -98,6 +110,74 @@ def search_period_by_shift_sum(
         is_plausible=is_plausible,
     )
 
+
+def build_strobe_windows(relative_offsets: Sequence[float], tolerance_ms: float) -> list[StrobeWindow]:
+    """Строит стробы для одной пачки импульсов относительно её начала."""
+
+    if tolerance_ms < 0:
+        raise ValueError("tolerance_ms must be non-negative")
+
+    return [StrobeWindow(offset - tolerance_ms, offset + tolerance_ms) for offset in relative_offsets]
+
+
+def tile_strobe_windows(
+    base_windows: Sequence[StrobeWindow],
+    period_ms: float,
+    num_packs: int,
+    start_time_ms: float = 0.0,
+) -> list[StrobeWindow]:
+    """Повторяет строб-окна для указанного числа пачек с заданным периодом."""
+
+    tiled: list[StrobeWindow] = []
+    for pack_index in range(num_packs):
+        shift = start_time_ms + pack_index * period_ms
+        for window in base_windows:
+            tiled.append(StrobeWindow(window.start_ms + shift, window.end_ms + shift))
+    return tiled
+
+
+def extend_sequence_from_base(
+    relative_offsets: Sequence[float],
+    start_time_ms: float,
+    num_packs: int,
+    period_ms: float,
+) -> list[float]:
+    """Продолжает импульсы, повторяя базовый набор относительных меток."""
+
+    if num_packs <= 0:
+        return []
+
+    continuation: list[float] = []
+    for pack_index in range(num_packs):
+        base_shift = start_time_ms + pack_index * period_ms
+        for offset in relative_offsets:
+            continuation.append(base_shift + offset)
+    return continuation
+
+
+def count_hits_in_strobes(times_ms: Sequence[float], strobes: Sequence[StrobeWindow]) -> tuple[int, int]:
+    """Считает попадания импульсов в заданные стробы."""
+
+    hits = 0
+    misses = 0
+    for t in times_ms:
+        if any(strobe.start_ms <= t <= strobe.end_ms for strobe in strobes):
+            hits += 1
+        else:
+            misses += 1
+    return hits, misses
+
+
+def analyze_impulse_times(
+    times_ms: Sequence[float],
+    config: PeriodSearchConfig,
+    resolution_ms: float = 1.0,
+) -> tuple[np.ndarray, PeriodSearchResult, dict[str, float | bool]]:
+    signal = rasterize_impulse_times(times_ms, resolution_ms=resolution_ms)
+    result = search_period_by_shift_sum(signal, config)
+    validation = validate_period(signal, result.estimated_period)
+    return signal, result, validation
+
 def validate_period(raw_signal: np.ndarray, estimated_period: int) -> dict[str, float | bool]:
     """Набор простых проверок, что найденный период действительно разумный."""
     if estimated_period <= 0 or estimated_period >= len(raw_signal):
@@ -134,3 +214,34 @@ def validate_period(raw_signal: np.ndarray, estimated_period: int) -> dict[str, 
         "repeat_consistency": repeat_consistency,
         "energy_ratio": energy_ratio,
     }
+
+
+def plot_shift_sum_curve(
+    result: PeriodSearchResult,
+    true_period: int | None = None,
+    ax: plt.Axes | None = None,
+) -> plt.Axes:
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(10, 4))
+
+    ax.plot(result.lag_values, result.score_curve, label="Сумма со сдвигом", color="tab:blue")
+    ax.axvline(
+        result.estimated_period,
+        linestyle=":",
+        color="tab:orange",
+        label=f"Найденный период = {result.estimated_period}",
+    )
+    if true_period is not None:
+        ax.axvline(
+            true_period,
+            linestyle="--",
+            color="tab:green",
+            label=f"Истинный период = {true_period}",
+        )
+
+    ax.set_xlabel("Сдвиг")
+    ax.set_ylabel("Скор")
+    ax.set_title("Кривая поиска периода")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    return ax

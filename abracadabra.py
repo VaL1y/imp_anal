@@ -13,14 +13,10 @@ max_interval_ms = 100
 epsilon_s = 0.005
 tolerance_ms = 1.0
 
-
 db_name = "experiment_results"
-
 
 clear_db_before_run = False
 
-
-# -----
 
 def init_database(db_name):
     db_file = f"{db_name}.db"
@@ -67,7 +63,6 @@ def get_statistics(db_name):
     stats = c.fetchall()
     conn.close()
     return stats
-
 
 def plot_results(stats, db_name):
     if not stats:
@@ -191,4 +186,3 @@ if stats:
     plot_results(stats, db_name)
 else:
     print("В выбранной базе пока нет данных.")
-

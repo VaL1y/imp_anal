@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Iterable, Sequence
+import math
+import random
 
 import numpy as np
 
@@ -17,13 +19,25 @@ class PulseSpec:
 
 @dataclass(slots=True)
 class BurstConfig:
-    """Параметры одной пачки и всей последовательности."""
+    """Параметры генерации цифровой пачки и всей последовательности."""
 
     burst_length: int
     repeats: int
     noise_std: float = 0.0
     baseline: float = 0.0
     seed: int | None = 33
+
+
+@dataclass(slots=True)
+class ImpulseTimingConfig:
+    """Параметры для генерации временных меток пачек импульсов."""
+
+    num_impulses_in_pack: int
+    min_interval_ms: int
+    max_interval_ms: int
+    generation_duration_s: float
+    noise_sigma_ms: float = 0.0
+    seed: int | None = 42
 
 
 DEFAULT_PULSES: tuple[PulseSpec, ...] = (
@@ -71,3 +85,74 @@ def build_repeated_signal(config: BurstConfig, pulses: Iterable[PulseSpec] = DEF
         signal = signal + rng.normal(0.0, config.noise_std, size=signal.shape)
 
     return signal, burst
+
+
+def build_impulse_relative_times(
+    num_impulses_in_pack: int,
+    min_interval_ms: int,
+    max_interval_ms: int,
+    rng: random.Random,
+) -> list[int]:
+    """Возвращает относительные времена импульсов внутри пачки."""
+    if num_impulses_in_pack < 2:
+        return [0]
+
+    rel_times: list[int] = [0]
+    for _ in range(num_impulses_in_pack - 1):
+        delta = rng.randint(min_interval_ms, max_interval_ms)
+        rel_times.append(rel_times[-1] + delta)
+    return rel_times
+
+
+def generate_impulse_pack_times(config: ImpulseTimingConfig) -> tuple[list[float], list[int]]:
+    """Генерирует метки времени импульсов с шумом по всей длительности."""
+    rng = random.Random(config.seed) if config.seed is not None else random.Random()
+    impulse_rel_times = build_impulse_relative_times(
+        config.num_impulses_in_pack,
+        config.min_interval_ms,
+        config.max_interval_ms,
+        rng,
+    )
+
+    if len(impulse_rel_times) < 2:
+        inter_pack_distance_ms = 0
+    else:
+        inter_pack_distance_ms = impulse_rel_times[1]
+
+    all_times: list[float] = []
+    current_pack_start = 0.0
+    max_time = config.generation_duration_s * 1000.0
+
+    while current_pack_start <= max_time:
+        for rel_time in impulse_rel_times:
+            noise = rng.gauss(0.0, config.noise_sigma_ms) if config.noise_sigma_ms > 0 else 0.0
+            all_times.append(current_pack_start + rel_time + noise)
+        if inter_pack_distance_ms == 0 and len(impulse_rel_times) > 1:
+            inter_pack_distance_ms = impulse_rel_times[1]
+        pack_end = current_pack_start + (impulse_rel_times[-1] if impulse_rel_times else 0)
+        current_pack_start = pack_end + inter_pack_distance_ms
+
+    return all_times, impulse_rel_times
+
+
+def rasterize_impulse_times(
+    times_ms: Sequence[float],
+    resolution_ms: float = 1.0,
+    max_time_ms: float | None = None,
+) -> np.ndarray:
+    """Конвертирует список меток времени в цифровой сигнал с заданным разрешением."""
+    if resolution_ms <= 0:
+        raise ValueError("resolution_ms must be positive")
+
+    max_time = max_time_ms if max_time_ms is not None else (max(times_ms) if times_ms else 0.0)
+    length = int(math.ceil(max_time / resolution_ms)) + 1
+    signal = np.zeros(length, dtype=float)
+
+    for time_ms in times_ms:
+        if time_ms < 0:
+            continue
+        idx = int(round(time_ms / resolution_ms))
+        if 0 <= idx < length:
+            signal[idx] += 1.0
+
+    return signal
